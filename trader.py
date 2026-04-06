@@ -1,3 +1,19 @@
+"""
+실시간 틱 기반 자동매매 모듈
+
+매수 조건 — 아래 3개 중 2개 이상 충족 시 진입:
+  1. 거래량 급증:   현재 체결량 >= 직전 30틱 평균 × 2
+  2. 체결강도:      누적 매수체결량 / 매도체결량 >= 110%
+  3. 매도잔량 소진: 최우선 매도호가 잔량 < 직전 평균의 30%
+
+청산 조건:
+  - 손절:          매수가 대비 -2%
+  - 트레일링 스탑: 고점 대비 -1.5%
+  - 강제 청산:     15:20
+
+매수 진입 허용 시간: 09:30 ~ 14:30
+"""
+
 import json
 import time
 import os
@@ -10,80 +26,105 @@ from api import get_token, get_stock_price
 
 load_dotenv()
 
-APP_KEY = os.getenv("APP_KEY")
-APP_SECRET = os.getenv("APP_SECRET")
-ACCOUNT_NO = os.getenv("ACCOUNT_NO")
+APP_KEY        = os.getenv("APP_KEY")
+APP_SECRET     = os.getenv("APP_SECRET")
+ACCOUNT_NO     = os.getenv("ACCOUNT_NO")
 ACCOUNT_NO_SEQ = os.getenv("ACCOUNT_NO_SEQ")
 BASE_URL = "https://openapivts.koreainvestment.com:29443"
-WS_URL = "ws://ops.koreainvestment.com:21000"
+WS_URL   = "ws://ops.koreainvestment.com:21000"
 
-MARKET_CLOSE_HOUR = 15
-MARKET_CLOSE_MINUTE = 30
+# ── 시간 설정 ──────────────────────────────────────────────
+BUY_START  = (9, 30)
+BUY_END    = (14, 30)
+FORCE_CLOSE   = (15, 20)
+MARKET_CLOSE  = (15, 30)
 
-FORCE_CLOSE_HOUR = 15
-FORCE_CLOSE_MINUTE = 20
+# ── 매수 조건 파라미터 ──────────────────────────────────────
+VOL_WARMUP       = 30    # 거래량 판단 최소 틱 수
+VOL_SPIKE_MULT   = 2.0   # 거래량 급증 배수
+STRENGTH_MIN     = 110.0 # 체결강도 최소값 (%)
+ASK_DEPLETE      = 0.3   # 소진 판정: 직전 평균 대비 이 비율 미만
+ASK_RECOVER      = 0.8   # 회복 판정: 직전 평균 대비 이 비율 초과
+BUY_COND_NEEDED  = 2     # 3개 조건 중 통과해야 할 최소 개수
 
-MAX_RECONNECT = 5       # 최대 재연결 시도 횟수
-RECONNECT_DELAY = 5     # 재연결 대기 초
+# ── 청산 파라미터 ───────────────────────────────────────────
+STOP_LOSS_PCT    = -2.0  # 손절 %
+TRAILING_PCT     = -1.5  # 트레일링 스탑 %
 
-# 종목별 상태 관리
-stock_state = {}
+# ── WebSocket 재연결 ────────────────────────────────────────
+MAX_RECONNECT   = 5
+RECONNECT_DELAY = 5
 
-def init_stock_state(code, open_price, prev_close, weight=1.0, bb_upper=0):
-    """종목 초기 상태 설정"""
-    gap = (open_price - prev_close) / prev_close * 100
+# 종목별 상태 (모듈 전역)
+stock_state: dict = {}
+
+
+# ── 상태 초기화 ─────────────────────────────────────────────
+
+def init_stock_state(code: str, weight: float = 1.0) -> None:
     stock_state[code] = {
-        "volumes": deque(maxlen=60),
-        "buy_vols": deque(maxlen=60),   # 매수 체결량 롤링 윈도우
-        "sell_vols": deque(maxlen=60),  # 매도 체결량 롤링 윈도우
-        "ask1_qty": 0,                  # 최우선 매도호가 잔량
-        "ask1_qty_hist": deque(maxlen=5),  # 매도1호가 잔량 히스토리
-        "ask_depleted": False,          # 매도 잔량 소진 플래그
-        "open_price": open_price,
-        "prev_close": prev_close,
-        "gap": gap,
-        "holding": False,
-        "buy_price": 0,
-        "high_price": 0,
-        "gap_ok": gap <= 10.0,
-        "weight": weight,
-        "bb_upper": bb_upper,           # 볼린저밴드 상단 (트레일링 스탑 홀드 기준)
+        "volumes":       deque(maxlen=60),
+        "buy_vols":      deque(maxlen=60),
+        "sell_vols":     deque(maxlen=60),
+        "ask1_qty":      0,
+        "ask1_qty_hist": deque(maxlen=5),
+        "ask_depleted":  False,
+        "holding":       False,
+        "buy_price":     0,
+        "high_price":    0,
+        "weight":        weight,
     }
 
-def is_market_closed():
-    """장 마감 여부 확인 (15:30 이후)"""
-    now = datetime.now()
-    return now.hour > MARKET_CLOSE_HOUR or (
-        now.hour == MARKET_CLOSE_HOUR and now.minute >= MARKET_CLOSE_MINUTE
-    )
 
-def is_force_close_time():
-    """15:20 강제 청산 시각 도달 여부"""
-    now = datetime.now()
-    return now.hour > FORCE_CLOSE_HOUR or (
-        now.hour == FORCE_CLOSE_HOUR and now.minute >= FORCE_CLOSE_MINUTE
-    )
+# ── 시간 헬퍼 ───────────────────────────────────────────────
 
-def get_available_cash(token):
-    """주문 가능 예수금 조회"""
-    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
-    headers = {
+def _hm(pair: tuple) -> tuple:
+    return pair
+
+def _now_hm() -> tuple:
+    n = datetime.now()
+    return (n.hour, n.minute)
+
+def is_buy_hours() -> bool:
+    """매수 진입 허용: 09:30 이상, 14:30 미만"""
+    t = _now_hm()
+    return BUY_START <= t < BUY_END
+
+def is_force_close_time() -> bool:
+    return _now_hm() >= FORCE_CLOSE
+
+def is_market_closed() -> bool:
+    return _now_hm() >= MARKET_CLOSE
+
+
+# ── API 헬퍼 ────────────────────────────────────────────────
+
+def _headers(token: str, tr_id: str) -> dict:
+    return {
         "authorization": f"Bearer {token}",
-        "appkey": APP_KEY,
-        "appsecret": APP_SECRET,
-        "tr_id": "VTTC8908R",
-        "content-type": "application/jsoㅏn"
+        "appkey":        APP_KEY,
+        "appsecret":     APP_SECRET,
+        "tr_id":         tr_id,
+        "content-type":  "application/json",
     }
-    params = {
-        "CANO": ACCOUNT_NO,
-        "ACNT_PRDT_CD": ACCOUNT_NO_SEQ,
-        "PDNO": "005930",
-        "ORD_UNPR": "0",
-        "ORD_DVSN": "01",
-        "CMA_EVLU_AMT_ICLD_YN": "N",
-        "OVRS_ICLD_YN": "N"
-    }
-    res = requests.get(url, headers=headers, params=params)
+
+def get_approval_key() -> str:
+    res = requests.post(
+        f"{BASE_URL}/oauth2/Approval",
+        json={"grant_type": "client_credentials", "appkey": APP_KEY, "secretkey": APP_SECRET},
+    )
+    return res.json()["approval_key"]
+
+def get_available_cash(token: str) -> int:
+    res = requests.get(
+        f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+        headers=_headers(token, "VTTC8908R"),
+        params={
+            "CANO": ACCOUNT_NO, "ACNT_PRDT_CD": ACCOUNT_NO_SEQ,
+            "PDNO": "005930", "ORD_UNPR": "0", "ORD_DVSN": "01",
+            "CMA_EVLU_AMT_ICLD_YN": "N", "OVRS_ICLD_YN": "N",
+        },
+    )
     data = res.json()
     if data.get("rt_cd") != "0":
         print(f"예수금 조회 실패: {data.get('msg1', '')}")
@@ -92,79 +133,18 @@ def get_available_cash(token):
     print(f"주문 가능 예수금: {cash:,}원")
     return cash
 
-def get_approval_key():
-    url = f"{BASE_URL}/oauth2/Approval"
-    data = {
-        "grant_type": "client_credentials",
-        "appkey": APP_KEY,
-        "secretkey": APP_SECRET
-    }
-    res = requests.post(url, json=data)
-    return res.json()["approval_key"]
-
-def buy_order(token, code, price):
-    """모의투자 매수 주문 (비중 기반 수량 계산). 성공 여부 반환."""
-    state = stock_state.get(code, {})
-    weight = state.get("weight", 1.0)
-
-    cash = get_available_cash(token)
-    if cash <= 0:
-        print(f"{code} 예수금 부족으로 매수 취소")
-        return False
-
-    alloc_amount = int(cash * weight)
-    qty = alloc_amount // price
-    if qty <= 0:
-        print(f"{code} 배분 금액({alloc_amount:,}원)으로 {price:,}원짜리 매수 불가")
-        return False
-
-    print(f"{code} 매수: 비중 {weight*100:.1f}% | 배분금액 {alloc_amount:,}원 | {price:,}원 × {qty}주")
-
-    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-    headers = {
-        "authorization": f"Bearer {token}",
-        "appkey": APP_KEY,
-        "appsecret": APP_SECRET,
-        "tr_id": "VTTC0802U",
-        "content-type": "application/json"
-    }
-    data = {
-        "CANO": ACCOUNT_NO,
-        "ACNT_PRDT_CD": ACCOUNT_NO_SEQ,
-        "PDNO": code,
-        "ORD_DVSN": "01",
-        "ORD_QTY": str(qty),
-        "ORD_UNPR": "0"
-    }
-    res = requests.post(url, headers=headers, json=data)
-    result = res.json()
-    print(f"매수 주문 결과: {result}")
-    return result.get("rt_cd") == "0"
-
-def get_holding_qty(token, code):
-    """실제 보유 수량 조회"""
-    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
-    headers = {
-        "authorization": f"Bearer {token}",
-        "appkey": APP_KEY,
-        "appsecret": APP_SECRET,
-        "tr_id": "VTTC8434R",
-        "content-type": "application/json"
-    }
-    params = {
-        "CANO": ACCOUNT_NO,
-        "ACNT_PRDT_CD": ACCOUNT_NO_SEQ,
-        "AFHR_FLPR_YN": "N",
-        "OFL_YN": "",
-        "INQR_DVSN": "02",
-        "UNPR_DVSN": "01",
-        "FUND_STTL_ICLD_YN": "N",
-        "FNCG_AMT_AUTO_RDPT_YN": "N",
-        "PRCS_DVSN": "01",
-        "CTX_AREA_FK100": "",
-        "CTX_AREA_NK100": ""
-    }
-    res = requests.get(url, headers=headers, params=params)
+def get_holding_qty(token: str, code: str) -> int:
+    res = requests.get(
+        f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance",
+        headers=_headers(token, "VTTC8434R"),
+        params={
+            "CANO": ACCOUNT_NO, "ACNT_PRDT_CD": ACCOUNT_NO_SEQ,
+            "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02",
+            "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+        },
+    )
     data = res.json()
     if data.get("rt_cd") != "0":
         print(f"잔고 조회 실패: {data.get('msg1', '')}")
@@ -174,110 +154,71 @@ def get_holding_qty(token, code):
             return int(item.get("hldg_qty", 0))
     return 0
 
-def sell_order(token, code, price):
-    """모의투자 매도 주문 (실제 보유 수량 전량)"""
+def buy_order(token: str, code: str, price: int) -> bool:
+    """비중 기반 수량 계산 후 시장가 매수. 성공 여부 반환."""
+    weight = stock_state.get(code, {}).get("weight", 1.0)
+    cash = get_available_cash(token)
+    if cash <= 0:
+        print(f"{code} 예수금 부족 — 매수 취소")
+        return False
+
+    qty = int(cash * weight) // price
+    if qty <= 0:
+        print(f"{code} 배분금액({int(cash*weight):,}원)으로 {price:,}원짜리 매수 불가")
+        return False
+
+    print(f"{code} 매수: 비중 {weight*100:.1f}% | {price:,}원 × {qty}주")
+    res = requests.post(
+        f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-cash",
+        headers=_headers(token, "VTTC0802U"),
+        json={
+            "CANO": ACCOUNT_NO, "ACNT_PRDT_CD": ACCOUNT_NO_SEQ,
+            "PDNO": code, "ORD_DVSN": "01", "ORD_QTY": str(qty), "ORD_UNPR": "0",
+        },
+    )
+    result = res.json()
+    print(f"매수 결과: {result}")
+    return result.get("rt_cd") == "0"
+
+def sell_order(token: str, code: str, price: int) -> None:
+    """실제 보유 수량 전량 시장가 매도."""
     qty = get_holding_qty(token, code)
     if qty <= 0:
         print(f"{code} 보유 수량 없음 — 매도 취소")
         return
+    res = requests.post(
+        f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-cash",
+        headers=_headers(token, "VTTC0801U"),
+        json={
+            "CANO": ACCOUNT_NO, "ACNT_PRDT_CD": ACCOUNT_NO_SEQ,
+            "PDNO": code, "ORD_DVSN": "01", "ORD_QTY": str(qty), "ORD_UNPR": "0",
+        },
+    )
+    print(f"매도 결과 ({qty}주): {res.json()}")
 
-    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
-    headers = {
-        "authorization": f"Bearer {token}",
-        "appkey": APP_KEY,
-        "appsecret": APP_SECRET,
-        "tr_id": "VTTC0801U",
-        "content-type": "application/json"
-    }
-    data = {
-        "CANO": ACCOUNT_NO,
-        "ACNT_PRDT_CD": ACCOUNT_NO_SEQ,
-        "PDNO": code,
-        "ORD_DVSN": "01",
-        "ORD_QTY": str(qty),
-        "ORD_UNPR": "0"
-    }
-    res = requests.post(url, headers=headers, json=data)
-    print(f"매도 주문 ({qty}주): {res.json()}")
 
-def sell_all_holdings(token):
-    """장 마감 시 보유 종목 처리: 조건 체크 후 미청산 포지션만 강제 청산"""
-    holding_codes = [code for code, s in stock_state.items() if s["holding"]]
-    if not holding_codes:
-        print("보유 종목 없음. 청산 생략.")
-        return
+# ── 체결강도 ────────────────────────────────────────────────
 
-    print(f"장 마감 포지션 점검: {holding_codes}")
-    for code in holding_codes:
-        price_data = get_stock_price(token, code)
-        if not price_data:
-            print(f"  {code} 현재가 조회 실패 — 청산 건너뜀")
-            time.sleep(0.5)
-            continue
-
-        price = price_data["price"]
-        state = stock_state[code]
-        buy_price = state["buy_price"]
-        change_rate = (price - buy_price) / buy_price * 100
-        trailing_rate = (price - state["high_price"]) / state["high_price"] * 100
-
-        if change_rate <= -2.0:
-            print(f"  {code} 손절 청산 | 수익률: {change_rate:.2f}%")
-            sell_order(token, code, price)
-            state["holding"] = False
-        elif trailing_rate <= -1.5:
-            print(f"  {code} 트레일링 스탑 청산 | 고점 대비: {trailing_rate:.2f}%")
-            sell_order(token, code, price)
-            state["holding"] = False
-        else:
-            # 조건 미달이지만 장 마감이므로 강제 청산
-            print(f"  {code} 장마감 강제 청산 | 현재가: {price:,} | 수익률: {change_rate:.2f}%")
-            sell_order(token, code, price)
-            state["holding"] = False
-
-        time.sleep(0.5)
-
-def check_holdings_after_reconnect(token):
-    """재연결 후 보유 종목 현재가 조회 → 손절/청산 조건 즉시 체크"""
-    holding_codes = [code for code, s in stock_state.items() if s["holding"]]
-    if not holding_codes:
-        return
-
-    print(f"재연결 후 보유 종목 점검: {holding_codes}")
-    for code in holding_codes:
-        price_data = get_stock_price(token, code)
-        if not price_data:
-            print(f"  {code} 현재가 조회 실패 — 점검 건너뜀")
-            continue
-        price = price_data["price"]
-        print(f"  {code} 재연결 후 현재가: {price:,}")
-        check_sell_condition(token, code, price)
-        time.sleep(0.3)
-
-def calc_execution_strength(code):
-    """체결강도 계산: 매수체결량 합계 / 매도체결량 합계 × 100"""
+def calc_execution_strength(code: str) -> float:
     state = stock_state.get(code)
     if not state:
         return 0.0
-    buy_sum = sum(state["buy_vols"])
     sell_sum = sum(state["sell_vols"])
     if sell_sum == 0:
         return 0.0
-    return buy_sum / sell_sum * 100
+    return sum(state["buy_vols"]) / sell_sum * 100
 
 
-def on_orderbook_message(code, data):
-    """H0STASP0 호가 데이터 처리 및 매도1호가 잔량 소진 감지.
+# ── 호가창 처리 ─────────────────────────────────────────────
 
-    H0STASP0 ^ 구분 필드 레이아웃 (KIS 기준):
-      [0]  종목코드
-      [1]  영업시간
-      [2~11]  매도호가1~10
-      [12~21] 매수호가1~10
-      [22~31] 매도호가잔량1~10  ← [22] = 최우선 매도호가 잔량
+def on_orderbook_message(code: str, data: list) -> None:
+    """H0STASP0 — 최우선 매도호가 잔량 소진 감지.
+
+    필드 레이아웃 (KIS H0STASP0 ^구분):
+      [0]  종목코드  [1] 영업시간
+      [2~11]  매도호가1~10    [12~21] 매수호가1~10
+      [22~31] 매도호가잔량1~10  ← [22] 최우선 매도호가 잔량
       [32~41] 매수호가잔량1~10
-      [42] 매도호가총잔량
-      [43] 매수호가총잔량
     """
     state = stock_state.get(code)
     if not state:
@@ -293,88 +234,81 @@ def on_orderbook_message(code, data):
     if len(hist) >= 3:
         prev_avg = sum(list(hist)[:-1]) / (len(hist) - 1)
         if prev_avg > 0:
-            if ask1_qty < prev_avg * 0.3:
+            if ask1_qty < prev_avg * ASK_DEPLETE:
                 if not state["ask_depleted"]:
                     print(f"{code} 매도잔량 소진 감지 | ask1: {ask1_qty} (직전평균: {prev_avg:.0f})")
                 state["ask_depleted"] = True
-            elif ask1_qty > prev_avg * 0.8:
+            elif ask1_qty > prev_avg * ASK_RECOVER:
                 state["ask_depleted"] = False
 
     state["ask1_qty"] = ask1_qty
 
 
-def check_buy_condition(_ws, token, code, price, volume):
-    """매수 조건 체크"""
+# ── 매수 조건 ───────────────────────────────────────────────
+
+def check_buy_condition(token: str, code: str, price: int, volume: int) -> None:
+    """3개 조건 중 2개 이상 충족 시 매수."""
     state = stock_state.get(code)
-    if not state:
+    if not state or state["holding"]:
         return
 
-    if state["holding"]:
-        check_sell_condition(token, code, price)
-        return
-
-    if not state["gap_ok"]:
+    if not is_buy_hours():
         return
 
     state["volumes"].append(volume)
-
-    if len(state["volumes"]) < 30:
+    if len(state["volumes"]) < VOL_WARMUP:
         return
 
-    avg_volume = sum(list(state["volumes"])[:-1]) / (len(state["volumes"]) - 1)
+    avg_vol  = sum(list(state["volumes"])[:-1]) / (len(state["volumes"]) - 1)
+    strength = calc_execution_strength(code)
 
-    if avg_volume > 0 and volume >= avg_volume * 2:
-        change_rate = (price - state["open_price"]) / state["open_price"] * 100
-        if change_rate > 0:
-            # 체결강도 110% 이상 조건
-            strength = calc_execution_strength(code)
-            if strength < 110.0:
-                print(f"  {code} 체결강도 미달: {strength:.1f}% (최소 110%)")
-                return
+    cond_vol = avg_vol > 0 and volume >= avg_vol * VOL_SPIKE_MULT
+    cond_str = strength >= STRENGTH_MIN
+    cond_ask = state["ask_depleted"]
 
-            # 매도 잔량 소진 조건
-            if not state["ask_depleted"]:
-                print(f"  {code} 매도잔량 소진 미감지 (ask1: {state['ask1_qty']})")
-                return
+    met = sum([cond_vol, cond_str, cond_ask])
+    if met < BUY_COND_NEEDED:
+        return
 
-            print(
-                f"매수 시그널 | {code} | 현재가: {price} | "
-                f"거래량 급증: {volume} (평균: {avg_volume:.0f}) | "
-                f"체결강도: {strength:.1f}% | 매도잔량 소진"
-            )
-            if buy_order(token, code, price):
-                state["holding"] = True
-                state["buy_price"] = price
-                state["high_price"] = price
+    print(
+        f"매수 시그널 | {code} | 현재가: {price:,} | 조건 {met}/3 | "
+        f"거래량급증: {'O' if cond_vol else 'X'} ({volume} / avg {avg_vol:.0f}) | "
+        f"체결강도: {'O' if cond_str else 'X'} ({strength:.1f}%) | "
+        f"매도잔량소진: {'O' if cond_ask else 'X'}"
+    )
+    if buy_order(token, code, price):
+        state["holding"]   = True
+        state["buy_price"] = price
+        state["high_price"] = price
 
-def check_sell_condition(token, code, price):
-    """매도 조건 체크 (손절 -2%, 트레일링 스탑 -1.5%).
-    BB 상단 터치 구간(price >= bb_upper)에서는 트레일링 스탑 비활성화.
-    """
+
+# ── 청산 조건 ───────────────────────────────────────────────
+
+def check_sell_condition(token: str, code: str, price: int) -> None:
+    """손절 -2%, 트레일링 스탑 -1.5%."""
     state = stock_state[code]
     buy_price = state["buy_price"]
 
     if price > state["high_price"]:
         state["high_price"] = price
 
-    change_rate = (price - buy_price) / buy_price * 100
+    change_rate   = (price - buy_price)         / buy_price         * 100
     trailing_rate = (price - state["high_price"]) / state["high_price"] * 100
 
-    if change_rate <= -2.0:
+    if change_rate <= STOP_LOSS_PCT:
         print(f"손절 | {code} | 수익률: {change_rate:.2f}%")
         sell_order(token, code, price)
         state["holding"] = False
 
-    elif trailing_rate <= -1.5:
-        bb_upper = state["bb_upper"]
-        if bb_upper > 0 and price >= bb_upper:
-            print(f"트레일링 스탑 홀드 | {code} | BB상단({bb_upper:,}) 터치 구간 — 매도 보류")
-        else:
-            print(f"트레일링 스탑 | {code} | 고점 대비: {trailing_rate:.2f}%")
-            sell_order(token, code, price)
-            state["holding"] = False
+    elif trailing_rate <= TRAILING_PCT:
+        print(f"트레일링 스탑 | {code} | 고점 대비: {trailing_rate:.2f}%")
+        sell_order(token, code, price)
+        state["holding"] = False
 
-def on_message(ws, message, token):
+
+# ── WebSocket 핸들러 ─────────────────────────────────────────
+
+def on_message(ws, message: str, token: str) -> None:
     if not message:
         return
 
@@ -385,89 +319,127 @@ def on_message(ws, message, token):
 
     if message[0] in ('0', '1'):
         try:
-            recvstr = message.split('|')
-            trid = recvstr[1]
+            parts = message.split('|')
+            trid  = parts[1]
 
             if trid == "H0STCNT0":
-                data = recvstr[3].split('^')
-                code = data[0]
-                price = int(data[2])
+                data   = parts[3].split('^')
+                code   = data[0]
+                price  = int(data[2])
                 volume = int(data[9])
-                # 체결구분 추적: data[8] 기준 '1'=매도, '2'=매수
+
                 state = stock_state.get(code)
                 if state and len(data) > 8:
+                    # data[8]: '1'=매도체결, '2'=매수체결
                     if data[8] == '2':
                         state["buy_vols"].append(volume)
                     else:
                         state["sell_vols"].append(volume)
-                print(f"{code} | 현재가: {price} | 체결량: {volume}")
-                check_buy_condition(ws, token, code, price, volume)
+
+                print(f"{code} | 현재가: {price:,} | 체결량: {volume}")
+
+                if state and state["holding"]:
+                    check_sell_condition(token, code, price)
+                else:
+                    check_buy_condition(token, code, price, volume)
 
             elif trid == "H0STASP0":
-                data = recvstr[3].split('^')
-                code = data[0]
-                on_orderbook_message(code, data)
+                data = parts[3].split('^')
+                on_orderbook_message(data[0], data)
+
         except (IndexError, ValueError) as e:
             print(f"메시지 파싱 오류 (무시): {e} | 원본: {message[:80]}")
     else:
         try:
             data = json.loads(message)
             print(f"응답: {data.get('body', {}).get('msg1', '')}")
-        except json.JSONDecodeError as e:
-            print(f"JSON 파싱 오류 (무시): {e}")
+        except json.JSONDecodeError:
+            pass
 
-def on_error(_ws, error):
+
+def on_error(_ws, error) -> None:
     print(f"오류: {error}")
 
-def on_close(_ws, _close_status_code, _close_msg):
+def on_close(_ws, _code, _msg) -> None:
     print("연결 종료")
 
-def on_open(ws, approval_key, target_list):
+def on_open(ws, approval_key: str, target_list: list) -> None:
     print("WebSocket 연결됨")
     for code in target_list:
         for tr_id in ("H0STCNT0", "H0STASP0"):
-            msg = {
+            ws.send(json.dumps({
                 "header": {
                     "approval_key": approval_key,
                     "custtype": "P",
                     "tr_type": "1",
-                    "content-type": "utf-8"
+                    "content-type": "utf-8",
                 },
-                "body": {
-                    "input": {
-                        "tr_id": tr_id,
-                        "tr_key": code
-                    }
-                }
-            }
-            ws.send(json.dumps(msg))
+                "body": {"input": {"tr_id": tr_id, "tr_key": code}},
+            }))
             time.sleep(0.1)
         print(f"{code} 구독 등록 (체결 + 호가창)")
 
-def make_on_open_handler(approval_key, target_list, token, is_reconnect):
-    """on_open 핸들러 생성 (클로저 캡처 + 재연결 시 보유 종목 즉시 점검)"""
+
+# ── 재연결 후 보유 종목 즉시 점검 ──────────────────────────────
+
+def check_holdings_after_reconnect(token: str) -> None:
+    holding = [c for c, s in stock_state.items() if s["holding"]]
+    if not holding:
+        return
+    print(f"재연결 후 보유 종목 점검: {holding}")
+    for code in holding:
+        price_data = get_stock_price(token, code)
+        if not price_data:
+            print(f"  {code} 현재가 조회 실패 — 건너뜀")
+            continue
+        check_sell_condition(token, code, price_data["price"])
+        time.sleep(0.3)
+
+
+def _make_on_open(approval_key: str, target_list: list, token: str, is_reconnect: bool):
     def handler(ws):
         on_open(ws, approval_key, target_list)
         if is_reconnect:
             check_holdings_after_reconnect(token)
     return handler
 
-def start_trading(target_list, open_prices, prev_closes, weights=None, bb_uppers=None, token=None):
-    """매매 시작 (장 마감 자동 종료 + WebSocket 재연결 포함)"""
+
+# ── 장 마감 강제 청산 ────────────────────────────────────────
+
+def sell_all_holdings(token: str) -> None:
+    holding = [c for c, s in stock_state.items() if s["holding"]]
+    if not holding:
+        print("보유 종목 없음 — 청산 생략")
+        return
+    print(f"보유 종목 전량 청산: {holding}")
+    for code in holding:
+        price_data = get_stock_price(token, code)
+        price = price_data["price"] if price_data else stock_state[code]["buy_price"]
+        sell_order(token, code, price)
+        stock_state[code]["holding"] = False
+        time.sleep(0.5)
+
+
+# ── 진입점 ──────────────────────────────────────────────────
+
+def start_trading(target_list: list, weights: list = None, token: str = None) -> None:
+    """매매 시작.
+
+    Args:
+        target_list: 종목코드 리스트
+        weights:     종목별 자금 배분 비중 (None 이면 균등 배분)
+        token:       한투 API 액세스 토큰 (None 이면 자동 발급)
+    """
     if token is None:
         token = get_token()
 
+    n = len(target_list)
     if weights is None:
-        n = len(target_list)
         weights = [round(1.0 / n, 4)] * n if n > 0 else []
 
-    if bb_uppers is None:
-        bb_uppers = [0] * len(target_list)
-
-    for code, open_p, prev_c, w, bb_u in zip(target_list, open_prices, prev_closes, weights, bb_uppers):
-        init_stock_state(code, open_p, prev_c, weight=w, bb_upper=bb_u)
-        gap = stock_state[code]["gap"]
-        print(f"{code} | 시가: {open_p} | 갭: {gap:.2f}% | 비중: {w*100:.1f}% | BB상단: {bb_u:,} | {'통과' if gap <= 10 else '제외'}")
+    for code, w in zip(target_list, weights):
+        init_stock_state(code, weight=w)
+        print(f"{code} 등록 | 비중: {w*100:.1f}%")
 
     reconnect_count = 0
 
@@ -477,19 +449,18 @@ def start_trading(target_list, open_prices, prev_closes, weights=None, bb_uppers
 
         ws = websocket.WebSocketApp(
             WS_URL,
-            on_open=make_on_open_handler(approval_key, target_list, token, is_reconnect),
+            on_open=_make_on_open(approval_key, target_list, token, is_reconnect),
             on_message=lambda ws, msg, t=token: on_message(ws, msg, t),
             on_error=on_error,
-            on_close=on_close
+            on_close=on_close,
         )
         ws.run_forever()
 
         if is_force_close_time():
-            print("15:20 강제 청산 시각 — 청산 후 종료")
+            print("15:20 강제 청산 시각 — 종료")
             break
-
         if is_market_closed():
-            print("장 마감으로 WebSocket 종료")
+            print("장 마감 — 종료")
             break
 
         reconnect_count += 1
@@ -497,9 +468,8 @@ def start_trading(target_list, open_prices, prev_closes, weights=None, bb_uppers
             print(f"재연결 {MAX_RECONNECT}회 초과 — 매매 종료")
             break
 
-        print(f"연결 끊김. {RECONNECT_DELAY}초 후 재연결 시도... ({reconnect_count}/{MAX_RECONNECT})")
+        print(f"연결 끊김. {RECONNECT_DELAY}초 후 재연결... ({reconnect_count}/{MAX_RECONNECT})")
         time.sleep(RECONNECT_DELAY)
 
-    # 청산 (15:20 강제 청산 또는 장 마감 청산)
     sell_all_holdings(token)
     print("자동매매 종료")
