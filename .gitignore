@@ -1,0 +1,31 @@
+# 환경변수 / 시크릿 (절대 커밋 금지)
+.env
+token.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# 캐시 / 데이터
+cache_minute/
+cache_minute_test/
+backtest_result.csv
+
+# 로그
+logs/
+*.log
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 기타
+.DS_Store
