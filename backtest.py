@@ -1,6 +1,18 @@
 """
-KOSDAQ 중소형주 분봉 백테스트
-전략: VWAP + Bollinger Bands + 거래량 급증 조건 (1분봉)
+KOSDAQ 중소형주 1분봉 백테스트
+전략: 실시간 틱 2-of-3 조건의 분봉 근사 재현
+
+실제 trader.py 조건 → 분봉 프록시:
+  1. 거래량 급증   → 현재 봉 거래량 >= 직전 30봉 평균 × 2       (직접 계산)
+  2. 체결강도 110% → 캔들 매수 우위: (종가-시가)/(고가-저가) >= 0.5  (프록시)
+  3. 매도잔량 소진 → 직전 5봉 고가 돌파: 종가 > max(고가[-5:-1])     (프록시)
+
+  3개 중 2개 이상 충족 & 09:30~14:30 내 진입
+
+청산:
+  - 손절:          매수가 대비 -2%
+  - 트레일링 스탑: 고점 대비 -1.5%
+  - 강제 청산:     15:20 (혹은 데이터 마지막 봉)
 """
 
 from __future__ import annotations
@@ -39,43 +51,42 @@ except ImportError:
 END_DATE   = datetime.today().strftime("%Y%m%d")
 START_DATE = (datetime.today() - timedelta(days=90)).strftime("%Y%m%d")
 
-# Bollinger Bands (분봉 기준)
-BB_PERIOD  = 20
-BB_STD     = 2.0
+# 매수 조건 파라미터 (trader.py 와 동일)
+VOL_WARMUP      = 30    # 거래량 이동평균 기준 봉 수
+VOL_SPIKE_MULT  = 2.0   # 거래량 급증 배수
+STRENGTH_RATIO  = 0.5   # 캔들 매수 우위 판정 비율 (체결강도 프록시)
+BUY_COND_NEEDED = 2     # 3개 조건 중 최소 통과 수
 
-# 거래량 급증
-VOL_SPIKE  = 2.0
-VOL_MA     = 20
+# 청산 파라미터 (trader.py 와 동일)
+STOP_LOSS_PCT  = -2.0   # 손절 %
+TRAILING_PCT   = -1.5   # 트레일링 스탑 %
 
-# 진입/청산 기준
-STOP_LOSS        = -0.03   # -3% 손절
-MAX_HOLD_MINUTES = 120     # 최대 보유 시간 (분)
-
-# 장 시간 필터 (개장 초반 / 동시호가 제외)
-MARKET_OPEN  = "09:05"
-MARKET_CLOSE = "15:19"
+# 거래 시간 (trader.py 와 동일)
+MARKET_OPEN  = "09:30"  # 데이터 수집 시작 (between_time 용)
+MARKET_CLOSE = "15:20"  # 강제 청산 / 데이터 수집 종료
+BUY_START    = "09:30"  # 매수 진입 허용 시작
+BUY_END      = "14:30"  # 매수 진입 허용 종료
 
 # 시가총액 필터 (억 원)
-MKTCAP_MIN = 300
+MKTCAP_MIN = 500
 MKTCAP_MAX = 5_000
 
 # 캐시 / 성능
 CACHE_DIR   = "cache_minute"
-API_DELAY   = 0.15    # pykrx 부하 방지 (초)
-MAX_TICKERS = 200     # None 이면 전체 유니버스 사용
+API_DELAY   = 0.15
+MAX_TICKERS = 200   # None 이면 전체 유니버스 사용
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# 한투 API 토큰 (main()에서 초기화)
 _KIS_TOKEN: str = ""
 
 
 # ─────────────────────────────────────────────
-# 유니버스 구성: KOSDAQ 중소형주
+# 유니버스 구성
 # ─────────────────────────────────────────────
+
 def _filter_by_volume(tickers: list[str], base_date: str) -> list[str]:
     """pykrx 일봉으로 거래량=0 종목 제거 (거래정지·관리종목 등)"""
-    # 가장 최근 거래일 데이터를 한 번에 조회
     ohlcv_df = None
     for days_back in range(0, 6):
         date = (datetime.strptime(base_date, "%Y%m%d") - timedelta(days=days_back)).strftime("%Y%m%d")
@@ -88,13 +99,13 @@ def _filter_by_volume(tickers: list[str], base_date: str) -> list[str]:
             continue
 
     if ohlcv_df is None:
-        return tickers  # 조회 실패 시 필터링 없이 반환
+        return tickers
 
     liquid = set(ohlcv_df[ohlcv_df["거래량"] > 0].index.tolist())
     before = len(tickers)
     result = [t for t in tickers if t in liquid]
     removed = before - len(result)
-    if removed > 0:
+    if removed:
         print(f"    거래량=0 종목 제외: {removed}개 (거래정지·관리종목 등)")
     return result
 
@@ -149,10 +160,10 @@ def get_kosdaq_small_mid_cap(base_date: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────
-# 거래일 목록 조회
+# 거래일 목록
 # ─────────────────────────────────────────────
+
 def get_trading_dates(start: str, end: str) -> list[str]:
-    """삼성전자 일봉 기준으로 거래일 목록 반환 (YYYYMMDD 문자열)"""
     try:
         df = stock.get_market_ohlcv_by_date(start, end, "005930")
     except Exception:
@@ -165,6 +176,7 @@ def get_trading_dates(start: str, end: str) -> list[str]:
 # ─────────────────────────────────────────────
 # 분봉 데이터 수집 (캐시 우선)
 # ─────────────────────────────────────────────
+
 def _cache_path(ticker: str, date: str) -> str:
     ext = "parquet" if _HAS_PARQUET else "csv"
     return os.path.join(CACHE_DIR, f"{ticker}_{date}.{ext}")
@@ -185,7 +197,6 @@ def _write_cache(df: pd.DataFrame, path: str) -> None:
 
 def fetch_minute_data(ticker: str, date: str) -> pd.DataFrame:
     path = _cache_path(ticker, date)
-
     if os.path.exists(path):
         try:
             return _read_cache(path)
@@ -200,11 +211,8 @@ def fetch_minute_data(ticker: str, date: str) -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["time"], format="%Y%m%d%H%M%S")
     df = df.set_index("datetime").drop(columns=["time"])
     df = df.rename(columns={
-        "open":   "시가",
-        "high":   "고가",
-        "low":    "저가",
-        "close":  "종가",
-        "volume": "거래량",
+        "open": "시가", "high": "고가", "low": "저가",
+        "close": "종가", "volume": "거래량",
     })
 
     if df.empty:
@@ -219,44 +227,45 @@ def fetch_minute_data(ticker: str, date: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-# 지표 계산 (하루치 분봉)
+# 지표 계산 (분봉 기반 3개 조건 프록시)
 # ─────────────────────────────────────────────
-def calc_indicators_day(df: pd.DataFrame) -> pd.DataFrame:
+
+def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """3개 매수 조건의 분봉 프록시 계산.
+
+    cond_vol      : 거래량 급증 (직접) — vol >= 직전 30봉 평균 × 2
+    cond_strength : 체결강도 프록시   — 캔들 매수 우위 (종가-시가)/(고가-저가) >= 0.5
+    cond_breakout : 매도잔량 소진 프록시 — 직전 5봉 고가 돌파 (저항 돌파)
+    """
     df = df.copy()
 
-    # 인트라데이 누적 VWAP (매일 리셋)
-    tp = (df["고가"] + df["저가"] + df["종가"]) / 3
-    df["vwap"] = (tp * df["거래량"]).cumsum() / df["거래량"].cumsum().replace(0, np.nan)
+    # ── 조건 1: 거래량 급증 ──────────────────────
+    df["vol_ma"] = df["거래량"].rolling(VOL_WARMUP).mean()
+    df["cond_vol"] = df["거래량"] >= df["vol_ma"] * VOL_SPIKE_MULT
 
-    # Bollinger Bands
-    df["bb_mid"]   = df["종가"].rolling(BB_PERIOD).mean()
-    bb_std         = df["종가"].rolling(BB_PERIOD).std()
-    df["bb_upper"] = df["bb_mid"] + BB_STD * bb_std
-    df["bb_lower"] = df["bb_mid"] - BB_STD * bb_std
+    # ── 조건 2: 캔들 매수 우위 (체결강도 프록시) ──
+    body  = df["종가"] - df["시가"]
+    range_ = (df["고가"] - df["저가"]).replace(0, np.nan)
+    df["cond_strength"] = (body / range_) >= STRENGTH_RATIO
 
-    # 거래량 급증
-    df["vol_ma"]    = df["거래량"].rolling(VOL_MA).mean()
-    df["vol_spike"] = df["거래량"] >= df["vol_ma"] * VOL_SPIKE
+    # ── 조건 3: 직전 5봉 고가 돌파 (매도잔량 소진 프록시) ──
+    df["prev5_high"] = df["고가"].shift(1).rolling(5).max()
+    df["cond_breakout"] = df["종가"] > df["prev5_high"]
 
-    return df
-
-
-# ─────────────────────────────────────────────
-# 시그널 생성
-# ─────────────────────────────────────────────
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["entry"] = (
-        (df["종가"] >= df["vwap"]) &
-        (df["저가"] <= df["bb_lower"]) &
-        (df["vol_spike"])
+    # 충족 조건 수 (편의용)
+    df["cond_count"] = (
+        df["cond_vol"].astype(int) +
+        df["cond_strength"].astype(int) +
+        df["cond_breakout"].astype(int)
     )
+
     return df
 
 
 # ─────────────────────────────────────────────
-# 종목별 분봉 백테스트 (인트라데이, 오버나이트 없음)
+# 종목별 백테스트 (인트라데이, 오버나이트 없음)
 # ─────────────────────────────────────────────
+
 def backtest_ticker(ticker: str, trading_dates: list[str]) -> list[dict]:
     trades = []
 
@@ -266,198 +275,247 @@ def backtest_ticker(ticker: str, trading_dates: list[str]) -> list[dict]:
             continue
 
         df = df.between_time(MARKET_OPEN, MARKET_CLOSE)
-        if len(df) < BB_PERIOD + 5:
+        if len(df) < VOL_WARMUP + 10:
             continue
 
-        df = calc_indicators_day(df)
-        df = generate_signals(df)
-        df = df.dropna()
+        df = calc_indicators(df)
+        df = df.dropna(subset=["vol_ma", "prev5_high"])
         if df.empty:
             continue
 
         in_position = False
-        entry_price = None
+        entry_price = 0.0
         entry_time  = None
+        high_water  = 0.0
+        entry_conds = {}
 
-        for j, (dt, row) in enumerate(df.iterrows()):
-            is_last = (j == len(df) - 1)
+        rows = list(df.iterrows())
+        for j, (dt, row) in enumerate(rows):
+            is_last   = (j == len(rows) - 1)
+            time_str  = dt.strftime("%H:%M")
 
+            # ── 포지션 보유 중: 청산 조건 체크 ──────
             if in_position:
-                hold_min = int((dt - entry_time).total_seconds() / 60)
-                ret = (row["종가"] - entry_price) / entry_price
+                price = row["종가"]
+
+                if price > high_water:
+                    high_water = price
+
+                change_pct   = (price - entry_price) / entry_price * 100
+                trailing_pct = (price - high_water)  / high_water  * 100
 
                 exit_reason = None
-                exit_price  = row["종가"]
+                exit_price  = price
 
-                if ret <= STOP_LOSS:
+                if change_pct <= STOP_LOSS_PCT:
                     exit_reason = "손절"
-                    exit_price  = entry_price * (1 + STOP_LOSS)
-                elif row["종가"] >= row["bb_upper"]:
-                    exit_reason = "BB상단"
-                elif hold_min >= MAX_HOLD_MINUTES:
-                    exit_reason = f"보유{MAX_HOLD_MINUTES}분"
-                elif is_last:
-                    exit_reason = "장마감"
+                    exit_price  = entry_price * (1 + STOP_LOSS_PCT / 100)
+                elif trailing_pct <= TRAILING_PCT:
+                    exit_reason = "트레일링스탑"
+                elif time_str >= MARKET_CLOSE or is_last:
+                    exit_reason = "강제청산"
 
                 if exit_reason:
-                    final_ret = (exit_price - entry_price) / entry_price
+                    hold_min  = int((dt - entry_time).total_seconds() / 60)
+                    final_ret = (exit_price - entry_price) / entry_price * 100
                     trades.append({
                         "ticker":       ticker,
+                        "date":         date,
                         "entry_time":   entry_time.strftime("%Y-%m-%d %H:%M"),
                         "exit_time":    dt.strftime("%Y-%m-%d %H:%M"),
                         "hold_minutes": hold_min,
                         "entry_price":  round(entry_price, 2),
                         "exit_price":   round(exit_price, 2),
-                        "return_pct":   round(final_ret * 100, 2),
+                        "high_water":   round(high_water, 2),
+                        "return_pct":   round(final_ret, 2),
                         "exit_reason":  exit_reason,
+                        "cond_vol":     entry_conds.get("vol", False),
+                        "cond_strength":entry_conds.get("strength", False),
+                        "cond_breakout":entry_conds.get("breakout", False),
+                        "cond_count":   entry_conds.get("count", 0),
                     })
                     in_position = False
-                    continue  # 동일 바에서 재진입 방지
+                    continue  # 동일 봉에서 재진입 방지
 
-            if not in_position and row["entry"] and not is_last:
-                in_position = True
-                entry_price = row["종가"]
-                entry_time  = dt
+            # ── 미보유 중: 매수 조건 체크 (09:30~14:30) ──
+            if not in_position and BUY_START <= time_str < BUY_END and not is_last:
+                if row["cond_count"] >= BUY_COND_NEEDED:
+                    in_position  = True
+                    entry_price  = row["종가"]
+                    entry_time   = dt
+                    high_water   = row["종가"]
+                    entry_conds  = {
+                        "vol":      bool(row["cond_vol"]),
+                        "strength": bool(row["cond_strength"]),
+                        "breakout": bool(row["cond_breakout"]),
+                        "count":    int(row["cond_count"]),
+                    }
 
     return trades
 
 
 # ─────────────────────────────────────────────
-# 손절 건 진입 시간대 분포
+# 결과 출력 및 저장
 # ─────────────────────────────────────────────
-def print_stoploss_time_dist(sl_df: pd.DataFrame, sep: str) -> None:
-    sl_df = sl_df.copy()
-    sl_df["entry_dt"]  = pd.to_datetime(sl_df["entry_time"])
-    sl_df["entry_min"] = sl_df["entry_dt"].dt.hour * 60 + sl_df["entry_dt"].dt.minute
 
-    def to_bucket(m: int) -> str:
-        h    = m // 60
-        half = "00" if (m % 60) < 30 else "30"
-        return f"{h:02d}:{half}"
-
-    sl_df["bucket"] = sl_df["entry_min"].apply(to_bucket)
-
-    # 09:05 ~ 15:00 범위 버킷
-    buckets = []
-    for h in range(9, 16):
-        for half in ("00", "30"):
-            b = f"{h:02d}:{half}"
-            if "09:00" <= b <= "15:00":
-                buckets.append(b)
-
-    counts  = sl_df["bucket"].value_counts().reindex(buckets, fill_value=0)
-    max_cnt = counts.max() if counts.max() > 0 else 1
-
-    print(f"\n  [손절 건 진입 시간대 분포]  (총 {len(sl_df)}건)")
-    print(f"  {'시간대':<9} {'건수':>5}  분포")
-    print(f"  {'─'*9} {'─'*5}  {'─'*32}")
-    for bucket, cnt in counts.items():
-        bar = "█" * int(cnt / max_cnt * 32)
-        print(f"  {bucket:<9} {cnt:>5}건  {bar}")
-
-    # 요일별
-    sl_df["요일"] = sl_df["entry_dt"].dt.day_name().map({
-        "Monday": "월", "Tuesday": "화", "Wednesday": "수",
-        "Thursday": "목", "Friday": "금",
-    })
-    dow_order  = ["월", "화", "수", "목", "금"]
-    dow_counts = sl_df["요일"].value_counts().reindex(dow_order, fill_value=0)
-    max_dow    = dow_counts.max() if dow_counts.max() > 0 else 1
-
-    print(f"\n  [손절 건 진입 요일 분포]")
-    print(f"  {'요일':<5} {'건수':>5}  분포")
-    print(f"  {'─'*5} {'─'*5}  {'─'*32}")
-    for day, cnt in dow_counts.items():
-        bar = "█" * int(cnt / max_dow * 32)
-        print(f"  {day}요일  {cnt:>5}건  {bar}")
-
-    print(sep)
+def _bar(val: float, max_val: float, width: int = 32) -> str:
+    return "█" * int(val / max_val * width) if max_val > 0 else ""
 
 
-# ─────────────────────────────────────────────
-# 결과 출력
-# ─────────────────────────────────────────────
 def print_results(trades: list[dict]) -> None:
+    sep = "=" * 65
+
     if not trades:
-        print("\n[결과] 조건을 만족하는 거래 없음")
+        print(f"\n{sep}")
+        print("  [결과] 조건을 만족하는 거래 없음")
+        print(sep)
         return
 
     df = pd.DataFrame(trades)
 
-    total    = len(df)
-    wins     = (df["return_pct"] > 0).sum()
-    losses   = (df["return_pct"] <= 0).sum()
-    win_rate = wins / total * 100
+    total  = len(df)
+    wins   = (df["return_pct"] > 0).sum()
+    losses = (df["return_pct"] <= 0).sum()
+    wr     = wins / total * 100
 
     avg_ret  = df["return_pct"].mean()
-    avg_win  = df[df["return_pct"] > 0]["return_pct"].mean() if wins > 0 else 0
-    avg_loss = df[df["return_pct"] <= 0]["return_pct"].mean() if losses > 0 else 0
+    avg_win  = df[df["return_pct"] > 0]["return_pct"].mean() if wins  else 0.0
+    avg_loss = df[df["return_pct"] <= 0]["return_pct"].mean() if losses else 0.0
     max_win  = df["return_pct"].max()
     max_loss = df["return_pct"].min()
     avg_hold = df["hold_minutes"].mean()
 
-    gross_profit = df[df["return_pct"] > 0]["return_pct"].sum()
-    gross_loss   = abs(df[df["return_pct"] <= 0]["return_pct"].sum())
-    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    gross_p = df[df["return_pct"] > 0]["return_pct"].sum()
+    gross_l = abs(df[df["return_pct"] <= 0]["return_pct"].sum())
+    pf = gross_p / gross_l if gross_l > 0 else float("inf")
 
-    sep = "=" * 60
+    # 단순 자본 곡선 (거래 순서대로 수익률 누적, 슬리피지 0 가정)
+    cumret = (1 + df["return_pct"] / 100).cumprod()
+    total_ret = (cumret.iloc[-1] - 1) * 100
+    dd_series = cumret / cumret.cummax() - 1
+    max_dd = dd_series.min() * 100
 
     print(f"\n{sep}")
-    print(f"  VWAP + BB + 거래량급증 전략  분봉 백테스트 결과")
+    print(f"  실시간 틱 2-of-3 전략  분봉 백테스트 결과")
     print(f"  기간: {START_DATE} ~ {END_DATE}")
-    print(f"  장 시간: {MARKET_OPEN} ~ {MARKET_CLOSE}")
+    print(f"  매수 시간: {BUY_START} ~ {BUY_END}  |  강제청산: {MARKET_CLOSE}")
     print(f"  시장: KOSDAQ 중소형주 (시총 {MKTCAP_MIN}~{MKTCAP_MAX}억)")
+    print(f"  매수 조건: 3개 중 {BUY_COND_NEEDED}개 이상  |  손절 {STOP_LOSS_PCT}%  |  트레일링 {TRAILING_PCT}%")
     print(sep)
-    print(f"  총 거래 수      : {total:>6}건")
-    print(f"  승리 / 패배     : {wins:>4}건 / {losses:>4}건")
-    print(f"  승률            : {win_rate:>6.1f}%")
-    print(f"  평균 수익률     : {avg_ret:>+6.2f}%")
-    print(f"  평균 수익 (승)  : {avg_win:>+6.2f}%")
-    print(f"  평균 손실 (패)  : {avg_loss:>+6.2f}%")
-    print(f"  최대 수익       : {max_win:>+6.2f}%")
-    print(f"  최대 손실       : {max_loss:>+6.2f}%")
-    print(f"  Profit Factor   : {pf:>6.2f}")
-    print(f"  평균 보유 시간  : {avg_hold:>6.1f}분")
-    print(sep)
-
-    reason_counts = df["exit_reason"].value_counts()
-    print("  [청산 사유]")
-    for reason, cnt in reason_counts.items():
-        print(f"    {reason:<16}: {cnt}건")
+    print(f"  총 거래 수        : {total:>7,}건")
+    print(f"  승리 / 패배       : {wins:>5,}건 / {losses:>5,}건")
+    print(f"  승률              : {wr:>7.1f}%")
+    print(f"  평균 수익률       : {avg_ret:>+7.2f}%")
+    print(f"  평균 수익 (승)    : {avg_win:>+7.2f}%")
+    print(f"  평균 손실 (패)    : {avg_loss:>+7.2f}%")
+    print(f"  최대 수익         : {max_win:>+7.2f}%")
+    print(f"  최대 손실         : {max_loss:>+7.2f}%")
+    print(f"  Profit Factor     : {pf:>7.2f}")
+    print(f"  평균 보유 시간    : {avg_hold:>7.1f}분")
+    print(f"  누적 수익률(단순) : {total_ret:>+7.2f}%")
+    print(f"  최대 낙폭 (MDD)   : {max_dd:>+7.2f}%")
     print(sep)
 
-    # 손절 건 진입 시간대 분포
-    sl_df = df[df["exit_reason"] == "손절"]
-    if not sl_df.empty:
-        print_stoploss_time_dist(sl_df, sep)
-    else:
-        print("\n  [손절 건 없음]")
-        print(sep)
+    # 청산 사유별 통계
+    reason_grp = df.groupby("exit_reason")["return_pct"]
+    print("  [청산 사유별 통계]")
+    print(f"  {'사유':<14} {'건수':>5}  {'평균수익률':>10}  {'승률':>6}")
+    print(f"  {'─'*14} {'─'*5}  {'─'*10}  {'─'*6}")
+    for reason, grp in reason_grp:
+        cnt = len(grp)
+        avg = grp.mean()
+        wr_ = (grp > 0).sum() / cnt * 100
+        print(f"  {reason:<14} {cnt:>5,}건  {avg:>+9.2f}%  {wr_:>5.1f}%")
+    print(sep)
 
-    # 수익률 TOP 10
-    top10 = df.nlargest(10, "return_pct")[
-        ["ticker", "entry_time", "exit_time", "hold_minutes",
-         "entry_price", "exit_price", "return_pct", "exit_reason"]
-    ]
+    # 조건 조합별 거래 분포
+    combos = df.groupby(["cond_vol", "cond_strength", "cond_breakout"])["return_pct"]
+    print("  [매수 조건 조합별 통계]  (V=거래량, S=체결강도, B=저항돌파)")
+    print(f"  {'V S B':<7} {'건수':>5}  {'평균수익률':>10}  {'승률':>6}")
+    print(f"  {'─'*7} {'─'*5}  {'─'*10}  {'─'*6}")
+    for (cv, cs, cb), grp in combos:
+        label = f"{'O' if cv else 'X'} {'O' if cs else 'X'} {'O' if cb else 'X'}"
+        cnt  = len(grp)
+        avg  = grp.mean()
+        wr_  = (grp > 0).sum() / cnt * 100
+        print(f"  {label:<7} {cnt:>5,}건  {avg:>+9.2f}%  {wr_:>5.1f}%")
+    print(sep)
+
+    # 시간대별 진입 분포
+    df["entry_hm"] = pd.to_datetime(df["entry_time"]).dt.strftime("%H:%M")
+    buckets = []
+    for h in range(9, 15):
+        for m in (0, 30):
+            b = f"{h:02d}:{m:02d}"
+            if BUY_START <= b < BUY_END:
+                buckets.append(b)
+
+    def _bucket(hm: str) -> str:
+        h, m = int(hm[:2]), int(hm[3:])
+        return f"{h:02d}:{'00' if m < 30 else '30'}"
+
+    df["bucket"] = df["entry_hm"].apply(_bucket)
+    time_counts = df["bucket"].value_counts().reindex(buckets, fill_value=0)
+    max_tc = time_counts.max() if time_counts.max() > 0 else 1
+
+    print("  [진입 시간대 분포]")
+    print(f"  {'시간대':<7} {'건수':>5}  분포")
+    print(f"  {'─'*7} {'─'*5}  {'─'*32}")
+    for b, cnt in time_counts.items():
+        print(f"  {b:<7} {cnt:>5,}건  {_bar(cnt, max_tc)}")
+    print(sep)
+
+    # 수익률 TOP 10 / BOTTOM 5
+    cols = ["ticker", "entry_time", "exit_time", "hold_minutes",
+            "entry_price", "exit_price", "return_pct", "exit_reason",
+            "cond_vol", "cond_strength", "cond_breakout"]
+
+    top10 = df.nlargest(10, "return_pct")[cols]
     print("\n  [수익률 TOP 10]")
     print(top10.to_string(index=False))
 
-    # 손실 BOTTOM 5
-    bot5 = df.nsmallest(5, "return_pct")[
-        ["ticker", "entry_time", "exit_time", "hold_minutes",
-         "entry_price", "exit_price", "return_pct", "exit_reason"]
-    ]
+    bot5 = df.nsmallest(5, "return_pct")[cols]
     print("\n  [손실 BOTTOM 5]")
     print(bot5.to_string(index=False))
+    print()
 
-    out_path = "backtest_minute_result.csv"
-    df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"\n  [*] 전체 결과 저장: {out_path}")
+    # ── CSV 저장 ──────────────────────────────
+    save_cols = [
+        "ticker", "date", "entry_time", "exit_time", "hold_minutes",
+        "entry_price", "exit_price", "high_water", "return_pct", "exit_reason",
+        "cond_vol", "cond_strength", "cond_breakout", "cond_count",
+    ]
+    out_path = "backtest_result.csv"
+    df[save_cols].to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"  [*] 전체 결과 저장: {out_path}  ({total}건)")
+
+    # ── 요약 JSON 저장 ────────────────────────
+    import json
+    summary = {
+        "strategy":     "tick_2of3_proxy",
+        "start_date":   START_DATE,
+        "end_date":     END_DATE,
+        "buy_window":   f"{BUY_START}~{BUY_END}",
+        "stop_loss":    STOP_LOSS_PCT,
+        "trailing":     TRAILING_PCT,
+        "total_trades": int(total),
+        "win_rate":     round(wr, 2),
+        "avg_return":   round(avg_ret, 2),
+        "profit_factor":round(pf, 4),
+        "cumulative_return": round(total_ret, 2),
+        "max_drawdown": round(max_dd, 2),
+        "avg_hold_min": round(avg_hold, 1),
+    }
+    with open("backtest_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"  [*] 요약 저장: backtest_summary.json")
+    print(sep)
 
 
 # ─────────────────────────────────────────────
 # 메인
 # ─────────────────────────────────────────────
+
 def main():
     global _KIS_TOKEN
     _KIS_TOKEN = get_token()
@@ -473,7 +531,7 @@ def main():
         tickers = tickers[:MAX_TICKERS]
         print(f"[*] 종목 수 제한: {MAX_TICKERS}개")
 
-    print(f"[*] 거래일 조회 중...")
+    print("[*] 거래일 조회 중...")
     trading_dates = get_trading_dates(START_DATE, END_DATE)
     if not trading_dates:
         print("거래일 조회 실패. 종료합니다.")
@@ -485,10 +543,10 @@ def main():
         1 for t in tickers for d in trading_dates
         if os.path.exists(_cache_path(t, d))
     )
-    print(f"[*] 분봉 데이터: 총 {total_calls}건 필요 / 캐시 {cached}건")
-    if total_calls - cached > 0:
-        est_sec = (total_calls - cached) * API_DELAY
-        print(f"    신규 API 호출 예상 시간: 약 {est_sec/60:.0f}분")
+    print(f"[*] 분봉 데이터: 총 {total_calls:,}건 필요 / 캐시 {cached:,}건")
+    uncached = total_calls - cached
+    if uncached > 0:
+        print(f"    신규 API 호출 예상 시간: 약 {uncached * API_DELAY / 60:.0f}분")
 
     all_trades: list[dict] = []
     n = len(tickers)
